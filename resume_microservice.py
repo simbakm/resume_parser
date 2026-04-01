@@ -197,59 +197,23 @@ def _try_fix_truncated_json(output):
             continue
     return None
 
-def _merge_parsed_results(results):
-    """Merge structured results from multiple chunk parses."""
-    merged = {
-        'name': '', 'email': '', 'phone': '', 'location': '',
-        'skills': [], 'experience': [], 'education': [], 'languages': []
-    }
-
-    for result in results:
-        if not isinstance(result, dict):
-            continue
-
-        for field in ['name', 'email', 'phone', 'location']:
-            value = result.get(field)
-            if isinstance(value, str) and value.strip() and not merged[field].strip():
-                merged[field] = value.strip()
-
-        for field in ['skills', 'experience', 'education', 'languages']:
-            items = result.get(field)
-            if isinstance(items, list):
-                for item in items:
-                    if isinstance(item, str):
-                        normalized = item.strip()
-                        if normalized and normalized not in merged[field]:
-                            merged[field].append(normalized)
-                    else:
-                        if item not in merged[field]:
-                            merged[field].append(item)
-
-    # Guarantee fields exist
-    for field in ['name', 'email', 'phone', 'location']:
-        merged[field] = merged[field] if merged[field] else ""
-    for field in ['skills', 'experience', 'education', 'languages']:
-        merged[field] = merged[field] if merged[field] else []
-
-    return merged
-
-
-def _parse_llm_chunk(text, chunk_index=None, total_chunks=None):
-    """Parse one chunk of resume text with the local LLM."""
-    if chunk_index and total_chunks:
-        logger.info(f"   🔄 Chunk parse request (chunk {chunk_index}/{total_chunks})")
-    else:
-        logger.info("   🔄 Chunk parse request")
+def parse_with_llm(text):
+    """Use local LLM to extract structured information with high token budget"""
+    
+    logger.info("   📋 Preparing LLM input...")
 
     if llm is None:
         logger.error("LLM model is not initialized")
-        return {'error': 'LLM model not loaded'}
+        return {"error": "LLM model not loaded"}
 
-    max_chars = 1600
-    if len(text) > max_chars:
-        original_len = len(text)
-        text = text[:max_chars] + "..."
-        logger.warning(f"   ⚠️  Chunk text truncated from {original_len} to {max_chars} chars")
+    # Limit input to avoid token overflow, but be generous
+    max_input_chars = 3000
+    original_len = len(text)
+    if len(text) > max_input_chars:
+        logger.warning(f"   ⚠️  Text truncated from {original_len} to {max_input_chars} characters")
+        text = text[:max_input_chars] + "..."
+    
+    logger.info(f"   ✓ Input text length: {len(text)} characters")
 
     prompt = f"""Extract resume information and return ONLY valid JSON. Do not include any text before or after the JSON.
 
@@ -269,121 +233,104 @@ Return ONLY JSON with these fields (use empty arrays/strings if not found):
 }}"""
 
     try:
+        logger.info("   🔄 Sending request to Qwen 2.5 LLM (high token budget)...")
         llm_request_start = time.time()
+        
+        # Use large token budget to ensure complete JSON output
         response = llm(
             prompt,
-            max_tokens=1024,
+            max_tokens=8192,
             temperature=0.1,
             echo=False
         )
-
+        
         llm_request_time = time.time() - llm_request_start
-        logger.info(f"   ✓ Chunk LLM response in {llm_request_time:.2f}s")
+        logger.info(f"   ✓ LLM response received in {llm_request_time:.2f}s")
 
         output = response['choices'][0]['text'].strip()
-        logger.info(f"   ✓ Chunk output length: {len(output)}")
-
-        json_str = output
-        json_start = json_str.find('{')
-        if json_start != -1:
-            json_str = json_str[json_start:]
-
-        brace_count = 0
-        in_string = False
-        escape_next = False
-        json_end = -1
-
-        for i, char in enumerate(json_str):
-            if escape_next:
-                escape_next = False
-                continue
-            if char == '\\' and in_string:
-                escape_next = True
-                continue
-            if char == '"' and not escape_next:
-                in_string = not in_string
-                continue
-            if not in_string:
-                if char == '{':
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        json_end = i + 1
-                        break
-
-        if json_end != -1:
-            json_str = json_str[:json_end]
-
-        json_str = re.sub(r',\s*}', '}', json_str)
-        json_str = re.sub(r',\s*]', ']', json_str)
+        logger.info(f"   ✓ Response length: {len(output)} characters")
 
         try:
+            logger.info("   🔍 Parsing JSON response...")
+            json_start = output.find('{')
+            if json_start == -1:
+                logger.error("   ❌ No JSON object found in response")
+                raise ValueError("No JSON object found")
+
+            json_str = output[json_start:]
+            
+            # Find matching closing brace
+            brace_count = 0
+            in_string = False
+            escape_next = False
+            json_end = 0
+
+            for i, char in enumerate(json_str):
+                if escape_next:
+                    escape_next = False
+                    continue
+                
+                if char == '\\' and in_string:
+                    escape_next = True
+                    continue
+                
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                
+                if not in_string:
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_end = i + 1
+                            break
+
+            if json_end > 0:
+                json_str = json_str[:json_end]
+            
+            # Clean up common JSON issues
+            json_str = re.sub(r',\s*}', '}', json_str)
+            json_str = re.sub(r',\s*]', ']', json_str)
+
+            logger.info("   📦 Validating JSON structure...")
             parsed_data = json.loads(json_str)
+            logger.info("   ✓ JSON validation successful")
+
+            expected_fields = ['name', 'email', 'phone', 'skills', 'experience', 'education', 'location', 'languages']
+            for field in expected_fields:
+                if field not in parsed_data:
+                    parsed_data[field] = [] if field in ['skills', 'experience', 'education', 'languages'] else ""
+
+            if 'skills' in parsed_data and isinstance(parsed_data['skills'], list):
+                hobbies = ['watching soccer', 'choir', 'soccer', 'football', 'singing']
+                original_skills = len(parsed_data['skills'])
+                parsed_data['skills'] = [s for s in parsed_data['skills']
+                                         if isinstance(s, str) and s.strip() and s.lower() not in hobbies]
+                if len(parsed_data['skills']) < original_skills:
+                    logger.info(f"   🧹 Removed {original_skills - len(parsed_data['skills'])} hobby items from skills")
+
+            logger.info("   ✅ LLM parsing completed successfully")
+            return parsed_data
+
         except json.JSONDecodeError as e:
-            logger.warning(f"   ⚠️  Chunk JSON decode issue: {e}")
-            parsed_data = _try_fix_truncated_json(json_str) or _try_fix_truncated_json(output)
-            if parsed_data is None:
-                logger.error("   ❌ Chunk JSON could not be repaired")
-                return {'error': 'Chunk JSON parsing failed', 'raw_output': output[:500]}
+            logger.error(f"   ❌ JSON parsing error: {str(e)}")
 
-        if not isinstance(parsed_data, dict):
-            raise ValueError("Parsed output is not a JSON object")
+            repaired = _try_fix_truncated_json(output)
+            if repaired is not None:
+                logger.info("   ✨ Repaired truncated JSON successfully")
+                return repaired
 
-        expected_fields = ['name', 'email', 'phone', 'skills', 'experience', 'education', 'location', 'languages']
-        for field in expected_fields:
-            if field not in parsed_data:
-                parsed_data[field] = [] if field in ['skills', 'experience', 'education', 'languages'] else ""
-
-        if 'skills' in parsed_data and isinstance(parsed_data['skills'], list):
-            hobbies = ['watching soccer', 'choir', 'soccer', 'football', 'singing']
-            parsed_data['skills'] = [s for s in parsed_data['skills'] if isinstance(s, str) and s.strip() and s.lower() not in hobbies]
-
-        logger.info("   ✅ Chunk successfully parsed")
-        return parsed_data
+            return {
+                "error": "JSON parsing failed",
+                "error_details": str(e),
+                "raw_extraction": output[:500]
+            }
 
     except Exception as e:
-        logger.error(f"   ❌ LLM chunk inference failed: {e}", exc_info=True)
-        return {'error': f"LLM chunk inference failed: {e}"}
-
-
-def parse_with_llm(text):
-    """Use local LLM to extract structured information"""
-    logger.info("   📋 Preparing LLM input...")
-
-    if llm is None:
-        logger.error("LLM model is not initialized")
-        return {"error": "LLM model not loaded"}
-
-    if len(text) > 2800:
-        logger.info("   🔷 Using chunked parsing for long text input")
-        chunk_size = 1400
-        overlap = 200
-        chunks = []
-        i = 0
-        while i < len(text):
-            chunk_text = text[i:i + chunk_size]
-            if i + chunk_size < len(text):
-                chunk_text = text[i:i + chunk_size + overlap]
-            chunks.append(chunk_text)
-            i += chunk_size
-
-        chunk_results = []
-        for idx, chunk_text in enumerate(chunks, start=1):
-            result = _parse_llm_chunk(chunk_text, idx, len(chunks))
-            if isinstance(result, dict) and 'error' not in result:
-                chunk_results.append(result)
-            else:
-                logger.warning(f"   ⚠️  Skipping invalid chunk result #{idx}: {result}")
-
-        if not chunk_results:
-            return {'error': 'All chunk parsing attempts failed'}
-
-        merged = _merge_parsed_results(chunk_results)
-        logger.info("   ✅ Chunked merge completed")
-        return merged
-
-    return _parse_llm_chunk(text, 1, 1)
+        logger.error(f"   ❌ LLM inference failed: {str(e)}", exc_info=True)
+        return {"error": f"LLM inference failed: {str(e)}"}
 
 @app.route('/health', methods=['GET'])
 def health_check():
