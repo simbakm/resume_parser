@@ -12,6 +12,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 import PyPDF2
+import pdfplumber
 import docx2txt
 from llama_cpp import Llama
 import re
@@ -52,9 +53,9 @@ def ensure_model():
     """
     if not os.path.exists(MODEL_PATH):
         print("\n" + "⚠️ "*30)
-        print("📥 DOWNLOADING MODEL - This may take 5-10 minutes on first startup...")
+        print("📥 DOWNLOADING MODEL - This may take 2-5 minutes on first startup...")
         print("⚠️ "*30)
-        download_model("qwen")
+        download_model("qwen_fast")
     else:
         print("✅ Model already exists, skipping download")
 
@@ -75,7 +76,7 @@ app.config['UPLOAD_EXTENSIONS'] = ['.pdf', '.docx', '.doc', '.txt']
 
 # ABSOLUTE PATH - Use the exact path from your diagnostic
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, 'resume_parser', 'models', 'qwen2.5-1.5b-instruct-q4_k_m.gguf')
+MODEL_PATH = os.path.join(BASE_DIR, 'resume_parser', 'models', 'qwen2.5-0.5b-instruct-q4_k_m.gguf')
 
 print("\n" + "="*60)
 print("🚀 RESUME PARSER MICROSERVICE - STARTUP SEQUENCE")
@@ -101,8 +102,8 @@ try:
     # Initialize the LLM with explicit CPU settings
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=2048,  # Context window
-        n_threads=6,  # Adjust based on your CPU
+        n_ctx=8192,  # Increased context window to handle large text limits and generation
+        n_threads=2,  # Optimized for 2-vCPU Hugging Face environments
         n_gpu_layers=0,  # Force CPU only
         verbose=False,   # Set to True for debugging
         use_mmap=True,   # Use memory mapping for faster loading
@@ -123,8 +124,23 @@ except Exception as e:
 print("="*60 + "\n")
 
 def extract_text_from_pdf(file_path):
-    """Extract text from PDF file"""
+    """Extract text from PDF file using pdfplumber as primary, fallback to PyPDF2"""
     text = ""
+    try:
+        # Primary: pdfplumber (more robust for layouts/encodings)
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        
+        if text.strip():
+            return text
+            
+    except Exception as e:
+        logger.warning(f"pdfplumber extraction error: {e}")
+
+    # Fallback: PyPDF2
     try:
         with open(file_path, 'rb') as file:
             pdf_reader = PyPDF2.PdfReader(file)
@@ -133,7 +149,8 @@ def extract_text_from_pdf(file_path):
                 if page_text:
                     text += page_text + "\n"
     except Exception as e:
-        print(f"PDF extraction error: {e}")
+        logger.error(f"PyPDF2 extraction error: {e}")
+        
     return text
 
 def extract_text_from_docx(file_path):
@@ -215,51 +232,75 @@ def parse_with_llm(text):
     
     logger.info(f"   ✓ Input text length: {len(text)} characters")
 
-    prompt = f"""Extract resume information and return ONLY valid JSON. Do not include any text before or after the JSON.
+    prompt = f"""Task: Extract resume fields into the following JSON format.
+Strict Rules: Use ONLY information from the resume. Do NOT use placeholder text.
 
 Resume:
 {text}
 
-Return ONLY JSON with these fields (use empty arrays/strings if not found):
+JSON Format:
 {{
-  "name": "candidate name",
-  "email": "email or empty",
-  "phone": "phone or empty",
-  "skills": ["skill1", "skill2"],
-  "experience": ["job1", "job2"],
-  "education": ["degree1", "degree2"],
-  "location": "location or empty",
-  "languages": ["lang1"]
+  "name": "",
+  "email": "",
+  "phone": "",
+  "skills": [],
+  "education": [
+    {{
+      "qualification": "",
+      "institution": "",
+      "year": ""
+    }}
+  ],
+  "experience": [
+    {{
+      "job_title": "",
+      "company": "",
+      "duration": ""
+    }}
+  ],
+  "objectives": "if not given, give a brief summary starting with To",
+  "location": "full address",
+  "languages": ["eg shona, english"]
 }}"""
 
     try:
         logger.info("   🔄 Sending request to Qwen 2.5 LLM (high token budget)...")
         llm_request_start = time.time()
         
-        # Use large token budget to ensure complete JSON output
-        response = llm(
-            prompt,
-            max_tokens=8192,
+        # Use chat completion to automatically apply ChatML stops and prevent runaway output
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a highly concise JSON extraction tool. Use empty strings for missing data. Do NOT repeat or summarize long sections of text. Be extremely brief."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=768, # Tightened to prevent wordy/repeated responses
             temperature=0.1,
-            echo=False
+            stop=["<|im_end|>", "<|endoftext|>", "```"]
         )
         
         llm_request_time = time.time() - llm_request_start
         logger.info(f"   ✓ LLM response received in {llm_request_time:.2f}s")
 
-        output = response['choices'][0]['text'].strip()
+        output = response['choices'][0]['message']['content'].strip()
         logger.info(f"   ✓ Response length: {len(output)} characters")
 
         try:
             logger.info("   🔍 Parsing JSON response...")
-            json_start = output.find('{')
+            
+            # 1. Clean markdown code blocks if present
+            clean_output = re.sub(r'```json\s*', '', output)
+            clean_output = re.sub(r'```\s*', '', clean_output)
+            clean_output = clean_output.strip()
+
+            # 2. Find the start of the JSON object
+            json_start = clean_output.find('{')
             if json_start == -1:
                 logger.error("   ❌ No JSON object found in response")
                 raise ValueError("No JSON object found")
 
-            json_str = output[json_start:]
+            json_str = clean_output[json_start:]
             
-            # Find matching closing brace
+            # 3. Find matching closing brace to handle extra text or unclosed arrays
             brace_count = 0
             in_string = False
             escape_next = False
@@ -289,6 +330,22 @@ Return ONLY JSON with these fields (use empty arrays/strings if not found):
 
             if json_end > 0:
                 json_str = json_str[:json_end]
+            elif brace_count > 0:
+                # If we never reached 0, it was truncated. Try to fix.
+                logger.warning(f"   ⚠️  JSON truncated (brace count: {brace_count})")
+                
+                # Simple balanced fix: append closing characters
+                # Check where it stopped. If in the middle of a string, close quote.
+                if in_string:
+                    json_str += '"'
+                
+                # Check for list/object structure
+                # This is heuristic, but helps recovery
+                if json_str.count('[') > json_str.count(']'):
+                    json_str += ']'
+                
+                json_str += '}' * brace_count
+                logger.info(f"   🔧 Applied basic balancing fix")
             
             # Clean up common JSON issues
             json_str = re.sub(r',\s*}', '}', json_str)
@@ -298,13 +355,21 @@ Return ONLY JSON with these fields (use empty arrays/strings if not found):
             parsed_data = json.loads(json_str)
             logger.info("   ✓ JSON validation successful")
 
-            expected_fields = ['name', 'email', 'phone', 'skills', 'experience', 'education', 'location', 'languages']
+            # Force name to ALL CAPS as required
+            if 'name' in parsed_data and isinstance(parsed_data['name'], str):
+                parsed_data['name'] = parsed_data['name'].upper()
+                logger.info(f"   ✓ Name formatted to ALL CAPS")
+
+            expected_fields = ['name', 'email', 'phone', 'skills', 'experience', 'education', 'location', 'languages', 'objectives']
             for field in expected_fields:
                 if field not in parsed_data:
-                    parsed_data[field] = [] if field in ['skills', 'experience', 'education', 'languages'] else ""
+                    if field in ['skills', 'experience', 'education', 'languages']:
+                        parsed_data[field] = []
+                    else:
+                        parsed_data[field] = ""
 
             if 'skills' in parsed_data and isinstance(parsed_data['skills'], list):
-                hobbies = ['watching soccer', 'choir', 'soccer', 'football', 'singing']
+                hobbies = ['watching soccer', 'choir', 'soccer', 'football', 'singing', 'hobbies']
                 original_skills = len(parsed_data['skills'])
                 parsed_data['skills'] = [s for s in parsed_data['skills']
                                          if isinstance(s, str) and s.strip() and s.lower() not in hobbies]
@@ -703,7 +768,7 @@ if __name__ == '__main__':
         print("   - POST /parse      - Upload resume file (PDF/DOCX/TXT)")
         print("   - POST /parse-text - Send raw text")
         print("\n📊 Model Information:")
-        print(f"   - Model: Qwen 2.5 1.5B Instruct (Quantized)")
+        print(f"   - Model: Qwen 2.5 0.5B Instruct Fast (Quantized)")
         print(f"   - Size: {os.path.getsize(MODEL_PATH) / (1024 * 1024):.1f} MB")
         print(f"   - Path: {MODEL_PATH}")
         print("\n🌐 Access:")
